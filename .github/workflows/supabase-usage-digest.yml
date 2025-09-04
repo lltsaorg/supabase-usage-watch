@@ -1,4 +1,4 @@
-name: Supabase Usage Digest (Gmail)
+name: Supabase Usage Digest (Gmail, with overall %)
 
 on:
   schedule:
@@ -11,17 +11,23 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      DB_FREE_MB: ${{ secrets.DB_FREE_MB }}
-      ST_FREE_MB: ${{ secrets.ST_FREE_MB }}
-      DAILY_EGRESS_MB_LIMIT: ${{ secrets.DAILY_EGRESS_MB_LIMIT }}
+
+      # Gmail API
       GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
       GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
       GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
       GMAIL_FROM: ${{ secrets.GMAIL_FROM }}
       GMAIL_TO: ${{ secrets.GMAIL_TO }}
+
+      # Free caps (override via Secrets if needed)
+      DB_FREE_MB: ${{ secrets.DB_FREE_MB }}
+      ST_FREE_MB: ${{ secrets.ST_FREE_MB }}
+      MONTHLY_EGRESS_FREE_MB: ${{ secrets.MONTHLY_EGRESS_FREE_MB }}
     steps:
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: (Optional) Insert 1 snapshot/day
         run: |
@@ -31,8 +37,9 @@ jobs:
             "$SUPABASE_URL/rest/v1/rpc/take_usage_snapshot" >/dev/null || true
 
       - name: Fetch DB/Storage (MB)
-        id: fetch
+        id: fetch_ds
         run: |
+          set -e
           DB=$(curl -sS -X POST \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
             -H "Content-Type: application/json" \
@@ -44,64 +51,61 @@ jobs:
           echo "db_mb=$DB" >> "$GITHUB_OUTPUT"
           echo "st_mb=$ST" >> "$GITHUB_OUTPUT"
 
-      - name: Try fetch today's Egress (MB)
-        id: egress
+      - name: Fetch Egress MTD (optional)
+        id: fetch_eg
         run: |
-          DAY=$(date -u +%F)
-          RES=$(curl -sS \
+          set -e
+          MONTH_START=$(date -u +"%Y-%m-01")
+          NEXT_MONTH_START=$(date -u -d "$MONTH_START +1 month" +%F)
+          HTTP=$(curl -sS -w "%{http_code}" -o eg.json \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            "$SUPABASE_URL/rest/v1/egress_daily_totals?day=eq.$DAY")
-          BYTES=$(echo "$RES" | jq -r 'if type=="array" and length>0 then .[0].bytes else 0 end' 2>/dev/null || echo 0)
-          MB=$(awk "BEGIN {printf \"%.1f\", ($BYTES/1024/1024)}")
-          echo "egress_mb=$MB" >> "$GITHUB_OUTPUT"
+            "$SUPABASE_URL/rest/v1/egress_daily_totals?select=bytes&day=gte.$MONTH_START&day=lt.$NEXT_MONTH_START")
+          if [ "$HTTP" = "200" ]; then
+            BYTES=$(jq -r '[.[].bytes] | add // 0' eg.json)
+            MB=$(awk "BEGIN {printf \"%.1f\", ($BYTES/1024/1024)}")
+            echo "egress_mtd_mb=$MB" >> "$GITHUB_OUTPUT"
+          else
+            echo "egress_mtd_mb=N/A" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Send Gmail digest
+      - name: Send Gmail digest (overall %)
         env:
-          DB: ${{ steps.fetch.outputs.db_mb }}
-          ST: ${{ steps.fetch.outputs.st_mb }}
-          EGRESS_MB: ${{ steps.egress.outputs.egress_mb }}
+          DB: ${{ steps.fetch_ds.outputs.db_mb }}
+          ST: ${{ steps.fetch_ds.outputs.st_mb }}
+          EGRESS_MTD_MB: ${{ steps.fetch_eg.outputs.egress_mtd_mb }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           DB_FREE_MB="${DB_FREE_MB:-500}"
           ST_FREE_MB="${ST_FREE_MB:-1024}"
-          DAILY_EGRESS_MB_LIMIT="${DAILY_EGRESS_MB_LIMIT:-160}"
+          MONTHLY_EGRESS_FREE_MB="${MONTHLY_EGRESS_FREE_MB:-5120}"  # 5GB
 
           PCT_DB=$(awk "BEGIN {if ($DB_FREE_MB==0) print 0; else printf \"%.1f\", ($DB/$DB_FREE_MB)*100}")
           PCT_ST=$(awk "BEGIN {if ($ST_FREE_MB==0) print 0; else printf \"%.1f\", ($ST/$ST_FREE_MB)*100}")
 
-          # Access token
+          if [[ "$EGRESS_MTD_MB" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            PCT_EG=$(awk "BEGIN {if ($MONTHLY_EGRESS_FREE_MB==0) print 0; else printf \"%.1f\", ($EGRESS_MTD_MB/$MONTHLY_EGRESS_FREE_MB)*100}")
+            EGRESS_LINE=$(printf "Egress (month-to-date): %s MB / %s MB  (%s%%)" "$EGRESS_MTD_MB" "$MONTHLY_EGRESS_FREE_MB" "$PCT_EG")
+          else
+            EGRESS_LINE="Egress (month-to-date): N/A  (enable self-measure or provide source)"
+          fi
+
           ACCESS_TOKEN=$(curl -sS -X POST https://oauth2.googleapis.com/token \
             -H "Content-Type: application/x-www-form-urlencoded" \
             -d "client_id=$GMAIL_CLIENT_ID&client_secret=$GMAIL_CLIENT_SECRET&refresh_token=$GMAIL_REFRESH_TOKEN&grant_type=refresh_token" \
             | jq -r '.access_token')
 
-          # Subject/body
           NOW_MMT=$(date -u -d "+6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
-          SUBJECT="[DAILY] Supabase usage summary"
-          BODY=$(cat <<EOF
-          Supabase daily usage (${NOW_MMT})
+          SUBJECT="[DAILY] Supabase usage summary (overall %)"
 
-          DB: ${DB} MB / ${DB_FREE_MB} MB  (${PCT_DB}%)
-          Storage: ${ST} MB / ${ST_FREE_MB} MB  (${PCT_ST}%)
-          Egress today: ${EGRESS_MB:-N/A} MB  (limit ~${DAILY_EGRESS_MB_LIMIT} MB/day)
-          EOF
-          )
+          BODY=$(printf "Supabase daily usage (%s)\n\nDB: %s MB / %s MB  (%s%%)\nStorage: %s MB / %s MB  (%s%%)\n%s\n" \
+            "$NOW_MMT" "$DB" "$DB_FREE_MB" "$PCT_DB" "$ST" "$ST_FREE_MB" "$PCT_ST" "$EGRESS_LINE")
 
-          # MIME → base64url
-          {
-            echo "From: ${GMAIL_FROM}"
-            echo "To: ${GMAIL_TO}"
-            echo "Subject: ${SUBJECT}"
-            echo "Content-Type: text/plain; charset=UTF-8"
-            echo
-            printf "%s" "$BODY"
-          } > mail.txt
-          RAW=$(base64 -w0 mail.txt | tr '+/' '-_' | tr -d '=')
+          MIME=$(printf "From: %s\nTo: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" "$GMAIL_FROM" "$GMAIL_TO" "$SUBJECT" "$BODY")
+          RAW=$(printf "%s" "$MIME" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+          PAYLOAD=$(jq -n --arg raw "$RAW" '{raw:$raw}')
 
-          # Send
-          payload=$(jq -n --arg raw "$RAW" '{raw:$raw}')
           curl -sS -X POST "https://gmail.googleapis.com/gmail/v1/users/me/messages/send" \
             -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" \
-            -d "$payload" >/dev/null
+            -d "$PAYLOAD" >/dev/null
 
           echo "Digest email sent."

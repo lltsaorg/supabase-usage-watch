@@ -1,8 +1,9 @@
-name: Supabase Usage Watch (Gmail)
+name: Supabase Usage Watch (Gmail, % of free cap)
 
 on:
   schedule:
     - cron: "0 3 * * *" # 03:00 UTC = 09:30 MMT
+    - cron: "0 15 * * *" # 15:00 UTC = 21:30 MMT
   workflow_dispatch:
 
 jobs:
@@ -11,8 +12,13 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      DB_MB_LIMIT: ${{ secrets.DB_MB_LIMIT }}
-      ST_MB_LIMIT: ${{ secrets.ST_MB_LIMIT }}
+
+      # 無料枠（%計算用）とアラート閾値（%）
+      DB_FREE_MB: ${{ secrets.DB_FREE_MB }}
+      ST_FREE_MB: ${{ secrets.ST_FREE_MB }}
+      ALERT_PCT: ${{ secrets.ALERT_PCT }}
+
+      # Gmail API
       GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
       GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
       GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
@@ -20,7 +26,9 @@ jobs:
       GMAIL_TO: ${{ secrets.GMAIL_TO }}
     steps:
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
 
       - name: Fetch DB/Storage (MB)
         id: fetch
@@ -37,46 +45,48 @@ jobs:
           echo "db_mb=$DB" >> "$GITHUB_OUTPUT"
           echo "st_mb=$ST" >> "$GITHUB_OUTPUT"
 
-      - name: Send Gmail if over threshold
+      - name: Send Gmail if over % threshold
         env:
           DB: ${{ steps.fetch.outputs.db_mb }}
           ST: ${{ steps.fetch.outputs.st_mb }}
         run: |
-          set -euo pipefail
-          DB_MB_LIMIT="${DB_MB_LIMIT:-400}"
-          ST_MB_LIMIT="${ST_MB_LIMIT:-800}"
+          set -Eeuo pipefail
 
-          DB_OVER=$(awk "BEGIN {print ($DB >= $DB_MB_LIMIT)?1:0}")
-          ST_OVER=$(awk "BEGIN {print ($ST >= $ST_MB_LIMIT)?1:0}")
+          # 既定値（Secrets未設定時）
+          DB_FREE_MB="${DB_FREE_MB:-500}"
+          ST_FREE_MB="${ST_FREE_MB:-1024}"
+          ALERT_PCT="${ALERT_PCT:-80}"   # 80%で警告
+
+          # %（小数1桁）
+          PCT_DB=$(awk "BEGIN {if ($DB_FREE_MB==0) print 0; else printf \"%.1f\", ($DB/$DB_FREE_MB)*100}")
+          PCT_ST=$(awk "BEGIN {if ($ST_FREE_MB==0) print 0; else printf \"%.1f\", ($ST/$ST_FREE_MB)*100}")
+
+          # アラート判定（無料枠の%）
+          DB_OVER=$(awk "BEGIN {print ($PCT_DB >= $ALERT_PCT)?1:0}")
+          ST_OVER=$(awk "BEGIN {print ($PCT_ST >= $ALERT_PCT)?1:0}")
 
           if [ "$DB_OVER" -eq 1 ] || [ "$ST_OVER" -eq 1 ]; then
-            # 1) アクセストークン取得
+            # Gmail Access Token
             ACCESS_TOKEN=$(curl -sS -X POST https://oauth2.googleapis.com/token \
               -H "Content-Type: application/x-www-form-urlencoded" \
               -d "client_id=$GMAIL_CLIENT_ID&client_secret=$GMAIL_CLIENT_SECRET&refresh_token=$GMAIL_REFRESH_TOKEN&grant_type=refresh_token" \
               | jq -r '.access_token')
 
-            # 2) MIME 作成
-            SUBJECT="[ALERT] Supabase usage"
-            BODY=$':warning: Supabase usage alert\n\n'"DB: $DB MB (limit $DB_MB_LIMIT)\nStorage: $ST MB (limit $ST_MB_LIMIT)"
-            {
-              echo "From: ${GMAIL_FROM}"
-              echo "To: ${GMAIL_TO}"
-              echo "Subject: ${SUBJECT}"
-              echo "Content-Type: text/plain; charset=UTF-8"
-              echo
-              printf "%s" "$BODY"
-            } > mail.txt
+            NOW_MMT=$(date -u -d "+6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
+            SUBJECT="[ALERT] Supabase usage ≥ ${ALERT_PCT}% of free cap"
+            BODY=$(printf "Supabase usage alert (%s)\n\nDB: %s MB / %s MB  (%s%%)\nStorage: %s MB / %s MB  (%s%%)\n" \
+              "$NOW_MMT" "$DB" "$DB_FREE_MB" "$PCT_DB" "$ST" "$ST_FREE_MB" "$PCT_ST")
 
-            # 3) base64url化
-            RAW=$(base64 -w0 mail.txt | tr '+/' '-_' | tr -d '=')
+            MIME=$(printf "From: %s\nTo: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" \
+              "$GMAIL_FROM" "$GMAIL_TO" "$SUBJECT" "$BODY")
+            RAW=$(printf "%s" "$MIME" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+            PAYLOAD=$(jq -n --arg raw "$RAW" '{raw:$raw}')
 
-            # 4) Gmail API 送信
             curl -sS -X POST "https://gmail.googleapis.com/gmail/v1/users/me/messages/send" \
               -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" \
-              -d "{\"raw\":\"$RAW\"}" >/dev/null
+              -d "$PAYLOAD" >/dev/null
 
             echo "Alert email sent."
           else
-            echo "Under limits."
+            echo "Under % threshold."
           fi
