@@ -1,0 +1,82 @@
+name: Supabase Usage Watch (Gmail)
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC = 09:30 MMT
+  workflow_dispatch:
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DB_MB_LIMIT: ${{ secrets.DB_MB_LIMIT }}
+      ST_MB_LIMIT: ${{ secrets.ST_MB_LIMIT }}
+      GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+      GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+      GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+      GMAIL_FROM: ${{ secrets.GMAIL_FROM }}
+      GMAIL_TO: ${{ secrets.GMAIL_TO }}
+    steps:
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Fetch DB/Storage (MB)
+        id: fetch
+        run: |
+          set -e
+          DB=$(curl -sS -X POST \
+            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" \
+            "$SUPABASE_URL/rest/v1/rpc/get_db_size_mb" | jq -r '.')
+          ST=$(curl -sS -X POST \
+            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" \
+            "$SUPABASE_URL/rest/v1/rpc/get_storage_total_mb" | jq -r '.')
+          echo "db_mb=$DB" >> "$GITHUB_OUTPUT"
+          echo "st_mb=$ST" >> "$GITHUB_OUTPUT"
+
+      - name: Send Gmail if over threshold
+        env:
+          DB: ${{ steps.fetch.outputs.db_mb }}
+          ST: ${{ steps.fetch.outputs.st_mb }}
+        run: |
+          set -euo pipefail
+          DB_MB_LIMIT="${DB_MB_LIMIT:-400}"
+          ST_MB_LIMIT="${ST_MB_LIMIT:-800}"
+
+          DB_OVER=$(awk "BEGIN {print ($DB >= $DB_MB_LIMIT)?1:0}")
+          ST_OVER=$(awk "BEGIN {print ($ST >= $ST_MB_LIMIT)?1:0}")
+
+          if [ "$DB_OVER" -eq 1 ] || [ "$ST_OVER" -eq 1 ]; then
+            # 1) アクセストークン取得
+            ACCESS_TOKEN=$(curl -sS -X POST https://oauth2.googleapis.com/token \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "client_id=$GMAIL_CLIENT_ID&client_secret=$GMAIL_CLIENT_SECRET&refresh_token=$GMAIL_REFRESH_TOKEN&grant_type=refresh_token" \
+              | jq -r '.access_token')
+
+            # 2) MIME 作成
+            SUBJECT="[ALERT] Supabase usage"
+            BODY=$':warning: Supabase usage alert\n\n'"DB: $DB MB (limit $DB_MB_LIMIT)\nStorage: $ST MB (limit $ST_MB_LIMIT)"
+            {
+              echo "From: ${GMAIL_FROM}"
+              echo "To: ${GMAIL_TO}"
+              echo "Subject: ${SUBJECT}"
+              echo "Content-Type: text/plain; charset=UTF-8"
+              echo
+              printf "%s" "$BODY"
+            } > mail.txt
+
+            # 3) base64url化
+            RAW=$(base64 -w0 mail.txt | tr '+/' '-_' | tr -d '=')
+
+            # 4) Gmail API 送信
+            curl -sS -X POST "https://gmail.googleapis.com/gmail/v1/users/me/messages/send" \
+              -H "Authorization: Bearer $ACCESS_TOKEN" -H "Content-Type: application/json" \
+              -d "{\"raw\":\"$RAW\"}" >/dev/null
+
+            echo "Alert email sent."
+          else
+            echo "Under limits."
+          fi
