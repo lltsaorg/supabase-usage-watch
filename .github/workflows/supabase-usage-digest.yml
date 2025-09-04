@@ -23,6 +23,8 @@ jobs:
       DB_FREE_MB: ${{ secrets.DB_FREE_MB }}
       ST_FREE_MB: ${{ secrets.ST_FREE_MB }}
       MONTHLY_EGRESS_FREE_MB: ${{ secrets.MONTHLY_EGRESS_FREE_MB }}
+      # Retention for usage_snapshots (days)
+      USAGE_SNAPSHOT_RETENTION_DAYS: ${{ secrets.USAGE_SNAPSHOT_RETENTION_DAYS }}
     steps:
       - name: Install tools
         run: |
@@ -35,6 +37,20 @@ jobs:
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
             -H "Content-Type: application/json" \
             "$SUPABASE_URL/rest/v1/rpc/take_usage_snapshot" >/dev/null || true
+
+      - name: Prune old usage_snapshots
+        run: |
+          set -e
+          DAYS="${USAGE_SNAPSHOT_RETENTION_DAYS:-90}"
+          # Use ISO8601 UTC timestamp for precise comparison
+          CUTOFF_ISO=$(date -u -d "-$DAYS days" +"%Y-%m-%dT%H:%M:%SZ")
+          echo "Pruning usage_snapshots older than $DAYS days (before $CUTOFF_ISO)"
+
+          # Delete rows older than cutoff; ignore error if table doesn't exist
+          curl -sS -X DELETE \
+            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
+            -H "Prefer: count=exact" \
+            "$SUPABASE_URL/rest/v1/usage_snapshots?created_at=lt.$CUTOFF_ISO" >/dev/null || true
 
       - name: Fetch DB/Storage (MB)
         id: fetch_ds
