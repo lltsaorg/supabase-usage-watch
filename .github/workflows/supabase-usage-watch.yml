@@ -3,7 +3,6 @@ name: Supabase Usage Watch (Gmail, % of free cap)
 on:
   schedule:
     - cron: "0 3 * * *" # 03:00 UTC = 09:30 MMT
-    - cron: "0 15 * * *" # 15:00 UTC = 21:30 MMT
   workflow_dispatch:
 
 jobs:
