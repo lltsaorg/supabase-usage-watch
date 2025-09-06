@@ -265,6 +265,25 @@ jobs:
             echo "peak=$PEAK24" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Write unified snapshot (DB/Storage/Realtime)
+        env:
+          DB: ${{ steps.fetch_ds.outputs.db_mb }}
+          ST: ${{ steps.fetch_ds.outputs.st_mb }}
+          RT_COUNTER: ${{ steps.rt_counter.outputs.counter }}
+          RT_CONN_PEAK: ${{ steps.rt_conn_peak.outputs.peak }}
+          RT_CONN_CURR: ${{ steps.rt_conn.outputs.current }}
+        run: |
+          set -Eeuo pipefail
+          NOWISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          CUR=${RT_CONN_CURR%.*}
+          # すべての主要カラムをまとめて1行に書き込む
+          curl -sS -X POST \
+            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
+            -H "Prefer: resolution=merge-duplicates" \
+            -H "Accept: application/json" -H "Content-Type: application/json" \
+            "$SUPABASE_URL/rest/v1/usage_snapshots" \
+            -d "{\"taken_at\":\"$NOWISO\",\"db_size_mb\":${DB:-0},\"storage_total_mb\":${ST:-0},\"realtime_msgs_counter\":${RT_COUNTER:-0},\"realtime_conn_peak\":${RT_CONN_PEAK:-0},\"realtime_conn_obs\":${CUR:-0}}" >/dev/null || true
+
       # ===== メール送信 =====
       - name: Send Gmail digest (overall %)
         env:
@@ -306,16 +325,27 @@ jobs:
           MONTH_START_UTC=$(date -u -d "$(date -u +%Y-%m-01)" "+%Y-%m-%d 00:00 UTC")
           WINDOW_START_UTC=$(date -u -d "-24 hours" "+%Y-%m-%d %H:%M UTC")
 
+          # 取得期間の表記（MMT / 日付含む、分まで）
+          NOW_MMT_SHORT=$(date -u -d "$NOW_UTC +6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
+          DBST_MMT=$(date -u -d "$NOW_UTC +6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
+          EG_START_MMT=$(date -u -d "$MONTH_START_UTC +6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
+          RT_BASE_UTC="${RT_BASE_AT:-$MONTH_START_UTC}"
+          RT_BASE_MMT=$(date -u -d "$RT_BASE_UTC +6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
+          WIN_START_MMT=$(date -u -d "$WINDOW_START_UTC +6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
+
           SUBJECT="[DAILY] Supabase usage summary (with periods)"
 
           # 本文を安全に構築（固定のフォーマットに%sを並べ、内容は引数で渡す）
-          BODY=$(printf "%s\n%s\n%s\n%s\n%s\n\n%s" \
+          BODY=$(printf "%s\n%s\n%s\n%s\n%s\n\n取得期間:\n%s\n%s\n%s\n%s" \
             "DB: $DB MB / $DB_FREE_MB MB  (${PCT_DB}%) 現在時点の使用量（スナップショット）" \
             "Storage: $ST MB / $ST_FREE_MB MB  (${PCT_ST}%) 現在時点の使用量（スナップショット）" \
             "Egress (month-to-date): ${EGRESS_MTD_MB} MB / $MONTHLY_EGRESS_FREE_MB MB  (${PCT_EG:-N/A}%) 月次累計" \
             "Realtime messages (month-to-date): ${RT_MTD:-N/A} / $REALTIME_FREE_MESSAGES  (${RT_PCT:-N/A}%) 月次累計" \
             "Realtime concurrent connections (24h peak): ${RT_CONN_PEAK_24H:-N/A} / $REALTIME_FREE_CONNECTIONS  (${RT_CONN_PCT:-N/A}%) 直近24時間ピーク" \
-            "取得期間: [DB/Storage] $NOW_UTC / [Egress] $MONTH_START_UTC → $NOW_UTC / [RT msgs] ${RT_BASE_AT:-$MONTH_START_UTC} → $NOW_UTC / [RT conn] $WINDOW_START_UTC → $NOW_UTC")
+            "[DB/Storage] $DBST_MMT" \
+            "[Egress] $EG_START_MMT → $NOW_MMT_SHORT" \
+            "[RT msgs] $RT_BASE_MMT → $NOW_MMT_SHORT" \
+            "[RT conn] $WIN_START_MMT → $NOW_MMT_SHORT")
 
           MIME=$(printf "From: %s\nTo: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" "$GMAIL_FROM" "$GMAIL_TO" "$SUBJECT" "$BODY")
           RAW=$(printf "%s" "$MIME" | base64 -w0 | tr '+/' '-_' | tr -d '=')
