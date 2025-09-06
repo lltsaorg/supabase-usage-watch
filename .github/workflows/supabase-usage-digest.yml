@@ -1,4 +1,4 @@
-name: Supabase Usage Digest (Gmail, with overall %)
+name: Supabase Usage Digest (no DB snapshots)
 
 on:
   schedule:
@@ -10,22 +10,21 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SERVICE_ROLE_KEY: ${{ secrets.SERVICE_ROLE_KEY }} # Metrics用
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }} # Mgmt(Usage) API用
 
-      # Gmail API
+      # Gmail
       GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
       GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
       GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
       GMAIL_FROM: ${{ secrets.GMAIL_FROM }}
       GMAIL_TO: ${{ secrets.GMAIL_TO }}
 
-      # Free caps (override via Secrets if needed)
+      # Free caps（未設定なら既定）
       DB_FREE_MB: ${{ secrets.DB_FREE_MB }}
       ST_FREE_MB: ${{ secrets.ST_FREE_MB }}
       MONTHLY_EGRESS_FREE_MB: ${{ secrets.MONTHLY_EGRESS_FREE_MB }}
-      REALTIME_FREE_MESSAGES: ${{ secrets.REALTIME_FREE_MESSAGES }} # unset時は2000000扱い
-      # Retention for usage_snapshots (days)
-      USAGE_SNAPSHOT_RETENTION_DAYS: ${{ secrets.USAGE_SNAPSHOT_RETENTION_DAYS }}
+      REALTIME_FREE_MESSAGES: ${{ secrets.REALTIME_FREE_MESSAGES }}
 
     steps:
       - name: Install tools
@@ -33,129 +32,162 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
 
-      - name: (Optional) Insert 1 snapshot/day
-        run: |
-          curl -sS -X POST \
-            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            -H "Content-Type: application/json" \
-            "$SUPABASE_URL/rest/v1/rpc/take_usage_snapshot" >/dev/null || true
-
-      - name: Prune old usage_snapshots
+      # ---------- [A] Management API で使用量取得（DB/Storage/Egress/MAU/Functions 等） ----------
+      # Management API の「Usage」系エンドポイントは個別に提供されています（PATでBearer認証）。
+      # ここでは代表例として Storage サイズ / Egress / Edge Functions / MAU をテンプレで示します。
+      # ※ 実際のエンドポイントは /api.supabase.com 側の Usage routes（PAT 必須）。
+      - name: Fetch usage via Management API (examples)
+        id: mgmt
+        env:
+          TOKEN: ${{ env.SUPABASE_ACCESS_TOKEN }}
+          # プロジェクトREFは SUPABASE_URL から推定 or 固定指定でもOK
+          URL: ${{ env.SUPABASE_URL }}
         run: |
           set -e
-          DAYS="${USAGE_SNAPSHOT_RETENTION_DAYS:-90}"
-          CUTOFF_ISO=$(date -u -d "-$DAYS days" +"%Y-%m-%dT%H:%M:%SZ")
-          echo "Pruning usage_snapshots older than $DAYS days (before $CUTOFF_ISO)"
-          curl -sS -X DELETE \
-            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            -H "Prefer: count=exact" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?created_at=lt.$CUTOFF_ISO" >/dev/null || true
+          # プロジェクトREFを URL から抽出（例: https://<ref>.supabase.co）
+          REF=$(echo "$URL" | awk -F[/:.] '{print $(NF-3)}')
+          BASE="https://api.supabase.com/api/v1"  # 管理APIホスト（安定運用中）
+          AUTH="Authorization: Bearer $TOKEN"
 
-      - name: Fetch DB/Storage (MB)
-        id: fetch_ds
+          # 例: ストレージ合計（MB相当）/ エグレス今月 / Edge Functions 今月 / MAU今月
+          # 実エンドポイントは plan/usage 系のルートで提供されます（PAT必須）
+          # 取得に失敗したら "N/A" を格納して先に進む
+          get_or_na () {
+            local url="$1"
+            local jqfilter="$2"
+            local out
+            out=$(curl -sS -H "$AUTH" "$url" | jq -r "$jqfilter" 2>/dev/null || true)
+            if [ -z "$out" ] || [ "$out" = "null" ]; then echo "N/A"; else echo "$out"; fi
+          }
+
+          # --- 以下はダミーの例示クエリ名です。実装時は Usage API の実エンドポイントに合わせて差し替え ---
+          # Storage size (MB)
+          ST=$(get_or_na "$BASE/projects/$REF/usage/storage" '.total_mb')
+          # Egress month-to-date (MB)
+          EG=$(get_or_na "$BASE/projects/$REF/usage/egress" '.mtd_mb')
+          # Edge Functions invocations month-to-date
+          FN=$(get_or_na "$BASE/projects/$REF/usage/functions" '.mtd')
+          # Auth MAU month-to-date
+          MAU=$(get_or_na "$BASE/projects/$REF/usage/mau" '.mtd')
+
+          echo "st_mb=$ST" >> "$GITHUB_OUTPUT"
+          echo "egress_mtd_mb=$EG" >> "$GITHUB_OUTPUT"
+          echo "func_mtd=$FN" >> "$GITHUB_OUTPUT"
+          echo "mau_mtd=$MAU" >> "$GITHUB_OUTPUT"
+
+      # ---------- [B] Realtime（Management APIで月次値が取れない場合のフォールバック） ----------
+      # Prometheus Metrics の累積カウンタから「月初との差」で MTD を算出。
+      # DBに書かず、Actions の "cache" に月初時点の値を数バイト保存。
+      - name: Compute Realtime MTD via Metrics + cache (no DB)
+        id: rt
+        uses: actions/cache@v4
+        with:
+          path: rt-baseline.json
+          key: rt-baseline-${{ hashFiles('rt-baseline.json') }}
+          restore-keys: |
+            rt-baseline-
+
+      - name: Read metrics and update baseline
+        id: rt_calc
+        env:
+          URL: ${{ env.SUPABASE_URL }}
+          SRK: ${{ env.SERVICE_ROLE_KEY }}
+        run: |
+          set -e
+          METRICS_URL="$URL/customer/v1/privileged/metrics"
+          curl -sS --user "service_role:${SRK}" "$METRICS_URL" > metrics.txt
+
+          # *_messages_total を合算
+          TOTAL=$(
+            awk '
+              /^[a-z_]+messages_total(\{| )/ && $NF ~ /^[0-9.]+$/ {sum+=$NF}
+              END {printf "%.0f", (sum==""?0:sum)}
+            ' metrics.txt
+          )
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+          MONTH=$(date -u +%Y-%m)
+          BASELINE=0
+          if [ -f rt-baseline.json ]; then
+            BASELINE=$(jq -r --arg m "$MONTH" '.[$m] // 0' rt-baseline.json 2>/dev/null || echo 0)
+          fi
+
+          # 月が変わったら baseline をリセット
+          if [ "$BASELINE" = "0" ]; then
+            jq -n --arg m "$MONTH" --argjson t "$TOTAL" '{($m):$t}' > rt-baseline.json
+          else
+            # 既存ファイルに今月キーがなければ追加
+            jq --arg m "$MONTH" --argjson t "$TOTAL" '. + {($m): (.[$m] // $t)}' rt-baseline.json > rt-baseline.tmp || echo '{}'
+            mv rt-baseline.tmp rt-baseline.json || true
+          fi
+
+          # MTD = 現在累積 - 月初基準
+          MTD=$(( TOTAL - BASELINE ))
+          if [ $MTD -lt 0 ]; then MTD=0; fi
+
+          echo "rt_mtd=$MTD" >> "$GITHUB_OUTPUT"
+
+      # ---------- [C] 既存: DBサイズ（必要なら Management API に置換可） ----------
+      - name: Fetch DB size (MB) via RPC (kept)
+        id: db
         run: |
           set -e
           DB=$(curl -sS -X POST \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
             -H "Content-Type: application/json" \
             "$SUPABASE_URL/rest/v1/rpc/get_db_size_mb" | jq -r '.')
-          ST=$(curl -sS -X POST \
-            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            -H "Content-Type: application/json" \
-            "$SUPABASE_URL/rest/v1/rpc/get_storage_total_mb" | jq -r '.')
           echo "db_mb=$DB" >> "$GITHUB_OUTPUT"
-          echo "st_mb=$ST" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch Egress MTD (optional)
-        id: fetch_eg
-        run: |
-          set -e
-          MONTH_START=$(date -u +"%Y-%m-01")
-          NEXT_MONTH_START=$(date -u -d "$MONTH_START +1 month" +%F)
-          HTTP=$(curl -sS -w "%{http_code}" -o eg.json \
-            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            "$SUPABASE_URL/rest/v1/egress_daily_totals?select=bytes&day=gte.$MONTH_START&day=lt.$NEXT_MONTH_START")
-          if [ "$HTTP" = "200" ]; then
-            BYTES=$(jq -r '[.[].bytes] | add // 0' eg.json)
-            MB=$(awk "BEGIN {printf \"%.1f\", ($BYTES/1024/1024)}")
-            echo "egress_mtd_mb=$MB" >> "$GITHUB_OUTPUT"
-          else
-            echo "egress_mtd_mb=N/A" >> "$GITHUB_OUTPUT"
-          fi
-
-      # ========= Realtime: 累積カウンタの取得 & スナップショット保存（表示はせずMTD算出用） =========
-      - name: Fetch Realtime cumulative & save snapshot
-        id: fetch_rt
-        run: |
-          set -e
-          METRICS_URL="$SUPABASE_URL/customer/v1/privileged/metrics"
-          curl -sS --user "service_role:${SERVICE_ROLE_KEY}" "$METRICS_URL" > metrics.txt
-
-          RT_TOTAL=$(
-            awk '
-              /^[a-z_]+messages_total(\{| )/ && $NF ~ /^[0-9.]+$/ {sum+=$NF}
-              END {printf "%.0f", (sum==""?0:sum)}
-            ' metrics.txt
-          )
-
-          if [ -z "$RT_TOTAL" ] || ! echo "$RT_TOTAL" | grep -Eq '^[0-9]+$'; then
-            echo "Could not parse realtime total. Skipping snapshot insert."
-          else
-            curl -sS -X POST \
-              -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-              -H "Content-Type: application/json" \
-              "$SUPABASE_URL/rest/v1/rpc/take_realtime_snapshot" \
-              -d "{\"in_total\": $RT_TOTAL}" >/dev/null
-          fi
-
-      # ========= Realtime: 当月MTD（max-min）計算をRPCで取得 =========
-      - name: Compute Realtime MTD (via RPC)
-        id: rt_mtd
-        run: |
-          set -e
-          MONTH_START_UTC=$(date -u +"%Y-%m-01T00:00:00Z")
-          HTTP=$(curl -sS -w "%{http_code}" -o out.json \
-            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            -H "Content-Type: application/json" \
-            -X POST "$SUPABASE_URL/rest/v1/rpc/get_realtime_mtd" \
-            -d "{\"in_month_start\":\"$MONTH_START_UTC\"}")
-          if [ "$HTTP" != "200" ]; then
-            echo "rt_mtd=N/A" >> "$GITHUB_OUTPUT"
-          else
-            VAL=$(jq -r '.' out.json)
-            echo "rt_mtd=$VAL" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Send Gmail digest (overall %)
+      # ---------- [D] メール送信 ----------
+      - name: Send Gmail digest
         env:
-          DB: ${{ steps.fetch_ds.outputs.db_mb }}
-          ST: ${{ steps.fetch_ds.outputs.st_mb }}
-          EGRESS_MTD_MB: ${{ steps.fetch_eg.outputs.egress_mtd_mb }}
-          REALTIME_MTD: ${{ steps.rt_mtd.outputs.rt_mtd }}
+          DB: ${{ steps.db.outputs.db_mb }}
+          ST: ${{ steps.mgmt.outputs.st_mb }}
+          EG: ${{ steps.mgmt.outputs.egress_mtd_mb }}
+          FN: ${{ steps.mgmt.outputs.func_mtd }}
+          MAU: ${{ steps.mgmt.outputs.mau_mtd }}
+          RT: ${{ steps.rt_calc.outputs.rt_mtd }}
+
+          GMAIL_CLIENT_ID: ${{ env.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ env.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ env.GMAIL_REFRESH_TOKEN }}
+          GMAIL_FROM: ${{ env.GMAIL_FROM }}
+          GMAIL_TO: ${{ env.GMAIL_TO }}
+
+          DB_FREE_MB: ${{ env.DB_FREE_MB }}
+          ST_FREE_MB: ${{ env.ST_FREE_MB }}
+          MONTHLY_EGRESS_FREE_MB: ${{ env.MONTHLY_EGRESS_FREE_MB }}
+          REALTIME_FREE_MESSAGES: ${{ env.REALTIME_FREE_MESSAGES }}
         run: |
           set -Eeuo pipefail
           DB_FREE_MB="${DB_FREE_MB:-500}"
           ST_FREE_MB="${ST_FREE_MB:-1024}"
           MONTHLY_EGRESS_FREE_MB="${MONTHLY_EGRESS_FREE_MB:-5120}"  # 5GB
-          REALTIME_FREE_MESSAGES="${REALTIME_FREE_MESSAGES:-2000000}" # 200万/月 (Free)
+          REALTIME_FREE_MESSAGES="${REALTIME_FREE_MESSAGES:-2000000}" # 200万
 
-          PCT_DB=$(awk "BEGIN {if ($DB_FREE_MB==0) print 0; else printf \"%.1f\", ($DB/$DB_FREE_MB)*100}")
-          PCT_ST=$(awk "BEGIN {if ($ST_FREE_MB==0) print 0; else printf \"%.1f\", ($ST/$ST_FREE_MB)*100}")
+          pct () { awk "BEGIN {if ($2==0) print 0; else printf \"%.1f\", ($1/$2)*100}"; }
 
-          if [[ "${EGRESS_MTD_MB}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-            PCT_EG=$(awk "BEGIN {if ($MONTHLY_EGRESS_FREE_MB==0) print 0; else printf \"%.1f\", ($EGRESS_MTD_MB/$MONTHLY_EGRESS_FREE_MB)*100}")
-            EGRESS_LINE=$(printf "Egress (month-to-date): %s MB / %s MB  (%s%%)" "$EGRESS_MTD_MB" "$MONTHLY_EGRESS_FREE_MB" "$PCT_EG")
+          PCT_DB=$(pct "$DB" "$DB_FREE_MB")
+          PCT_ST=$(pct "${ST:-0}" "$ST_FREE_MB")
+
+          if [[ "${EG}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            PCT_EG=$(pct "$EG" "$MONTHLY_EGRESS_FREE_MB")
+            EGRESS_LINE=$(printf "Egress MTD: %s MB / %s MB  (%s%%)" "$EG" "$MONTHLY_EGRESS_FREE_MB" "$PCT_EG")
           else
-            EGRESS_LINE="Egress (month-to-date): N/A  (enable self-measure or provide source)"
+            EGRESS_LINE="Egress MTD: N/A (Usage API unavailable)"
           fi
 
-          # Realtime (当月MTD) だけ表示
-          if [[ "${REALTIME_MTD:-}" =~ ^[0-9]+$ ]]; then
-            PCT_RT=$(awk "BEGIN {if ($REALTIME_FREE_MESSAGES==0) print 0; else printf \"%.2f\", ($REALTIME_MTD/$REALTIME_FREE_MESSAGES)*100}")
-            RT_MTD_LINE=$(printf "Realtime (month-to-date): %s / %s  (%s%% of monthly free)" "$REALTIME_MTD" "$REALTIME_FREE_MESSAGES" "$PCT_RT")
+          if [[ "${RT}" =~ ^[0-9]+$ ]]; then
+            PCT_RT=$(awk "BEGIN {if ($REALTIME_FREE_MESSAGES==0) print 0; else printf \"%.2f\", ($RT/$REALTIME_FREE_MESSAGES)*100}")
+            RT_LINE=$(printf "Realtime MTD: %s / %s  (%s%% of free)" "$RT" "$REALTIME_FREE_MESSAGES" "$PCT_RT")
           else
-            RT_MTD_LINE="Realtime (month-to-date): N/A"
+            RT_LINE="Realtime MTD: N/A"
           fi
+
+          FN_LINE="Functions MTD: ${FN:-N/A}"
+          MAU_LINE="Auth MAU MTD: ${MAU:-N/A}"
+          ST_LINE=$(printf "Storage: %s MB / %s MB  (%s%%)" "${ST:-N/A}" "$ST_FREE_MB" "$PCT_ST")
+          DB_LINE=$(printf "DB: %s MB / %s MB  (%s%%)" "$DB" "$DB_FREE_MB" "$PCT_DB")
 
           ACCESS_TOKEN=$(curl -sS -X POST https://oauth2.googleapis.com/token \
             -H "Content-Type: application/x-www-form-urlencoded" \
@@ -163,11 +195,10 @@ jobs:
             | jq -r '.access_token')
 
           NOW_MMT=$(date -u -d "+6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
-          SUBJECT="[DAILY] Supabase usage summary (overall %) — MTD only"
+          SUBJECT="[DAILY] Supabase usage (no DB snapshots)"
 
-          BODY=$(printf "Supabase daily usage (%s)\n\nDB: %s MB / %s MB  (%s%%)\nStorage: %s MB / %s MB  (%s%%)\n%s\n%s\n" \
-            "$NOW_MMT" "$DB" "$DB_FREE_MB" "$PCT_DB" "$ST" "$ST_FREE_MB" "$PCT_ST" \
-            "$EGRESS_LINE" "$RT_MTD_LINE")
+          BODY=$(printf "Supabase daily usage (%s)\n\n%s\n%s\n%s\n%s\n%s\n" \
+            "$NOW_MMT" "$DB_LINE" "$ST_LINE" "$EGRESS_LINE" "$RT_LINE" "$FN_LINE / $MAU_LINE")
 
           MIME=$(printf "From: %s\nTo: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" "$GMAIL_FROM" "$GMAIL_TO" "$SUBJECT" "$BODY")
           RAW=$(printf "%s" "$MIME" | base64 -w0 | tr '+/' '-_' | tr -d '=')
