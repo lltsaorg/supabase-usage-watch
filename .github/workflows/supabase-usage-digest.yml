@@ -23,7 +23,7 @@ jobs:
       DB_FREE_MB: ${{ secrets.DB_FREE_MB }}
       ST_FREE_MB: ${{ secrets.ST_FREE_MB }}
       MONTHLY_EGRESS_FREE_MB: ${{ secrets.MONTHLY_EGRESS_FREE_MB }}
-      REALTIME_FREE_MESSAGES: ${{ secrets.REALTIME_FREE_MESSAGES }} # default 2,000,000 if unset
+      REALTIME_FREE_MESSAGES: ${{ secrets.REALTIME_FREE_MESSAGES }} # unset時は2000000扱い
       # Retention for usage_snapshots (days)
       USAGE_SNAPSHOT_RETENTION_DAYS: ${{ secrets.USAGE_SNAPSHOT_RETENTION_DAYS }}
 
@@ -83,16 +83,14 @@ jobs:
             echo "egress_mtd_mb=N/A" >> "$GITHUB_OUTPUT"
           fi
 
-      # ========= Realtime: 累積カウンタの取得 & スナップショット保存 =========
+      # ========= Realtime: 累積カウンタの取得 & スナップショット保存（表示はせずMTD算出用） =========
       - name: Fetch Realtime cumulative & save snapshot
         id: fetch_rt
         run: |
           set -e
-
           METRICS_URL="$SUPABASE_URL/customer/v1/privileged/metrics"
           curl -sS --user "service_role:${SERVICE_ROLE_KEY}" "$METRICS_URL" > metrics.txt
 
-          # *_messages_total を広く拾って合算（Prometheus形式）
           RT_TOTAL=$(
             awk '
               /^[a-z_]+messages_total(\{| )/ && $NF ~ /^[0-9.]+$/ {sum+=$NF}
@@ -102,10 +100,7 @@ jobs:
 
           if [ -z "$RT_TOTAL" ] || ! echo "$RT_TOTAL" | grep -Eq '^[0-9]+$'; then
             echo "Could not parse realtime total. Skipping snapshot insert."
-            echo "realtime_total=N/A" >> "$GITHUB_OUTPUT"
           else
-            echo "realtime_total=$RT_TOTAL" >> "$GITHUB_OUTPUT"
-            # Supabase に当日のスナップショットを書き込み
             curl -sS -X POST \
               -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
               -H "Content-Type: application/json" \
@@ -136,7 +131,6 @@ jobs:
           DB: ${{ steps.fetch_ds.outputs.db_mb }}
           ST: ${{ steps.fetch_ds.outputs.st_mb }}
           EGRESS_MTD_MB: ${{ steps.fetch_eg.outputs.egress_mtd_mb }}
-          REALTIME_TOTAL: ${{ steps.fetch_rt.outputs.realtime_total }}
           REALTIME_MTD: ${{ steps.rt_mtd.outputs.rt_mtd }}
         run: |
           set -Eeuo pipefail
@@ -155,14 +149,7 @@ jobs:
             EGRESS_LINE="Egress (month-to-date): N/A  (enable self-measure or provide source)"
           fi
 
-          # Realtime (累積) — 参考表示
-          if [[ "${REALTIME_TOTAL:-}" =~ ^[0-9]+$ ]]; then
-            RT_TOTAL_LINE=$(printf "Realtime (cumulative counter): %s" "$REALTIME_TOTAL")
-          else
-            RT_TOTAL_LINE="Realtime (cumulative counter): N/A"
-          fi
-
-          # Realtime (当月MTD) — %評価の対象
+          # Realtime (当月MTD) だけ表示
           if [[ "${REALTIME_MTD:-}" =~ ^[0-9]+$ ]]; then
             PCT_RT=$(awk "BEGIN {if ($REALTIME_FREE_MESSAGES==0) print 0; else printf \"%.2f\", ($REALTIME_MTD/$REALTIME_FREE_MESSAGES)*100}")
             RT_MTD_LINE=$(printf "Realtime (month-to-date): %s / %s  (%s%% of monthly free)" "$REALTIME_MTD" "$REALTIME_FREE_MESSAGES" "$PCT_RT")
@@ -176,11 +163,11 @@ jobs:
             | jq -r '.access_token')
 
           NOW_MMT=$(date -u -d "+6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
-          SUBJECT="[DAILY] Supabase usage summary (overall %)"
+          SUBJECT="[DAILY] Supabase usage summary (overall %) — MTD only"
 
-          BODY=$(printf "Supabase daily usage (%s)\n\nDB: %s MB / %s MB  (%s%%)\nStorage: %s MB / %s MB  (%s%%)\n%s\n%s\n%s\n" \
+          BODY=$(printf "Supabase daily usage (%s)\n\nDB: %s MB / %s MB  (%s%%)\nStorage: %s MB / %s MB  (%s%%)\n%s\n%s\n" \
             "$NOW_MMT" "$DB" "$DB_FREE_MB" "$PCT_DB" "$ST" "$ST_FREE_MB" "$PCT_ST" \
-            "$EGRESS_LINE" "$RT_MTD_LINE" "$RT_TOTAL_LINE")
+            "$EGRESS_LINE" "$RT_MTD_LINE")
 
           MIME=$(printf "From: %s\nTo: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" "$GMAIL_FROM" "$GMAIL_TO" "$SUBJECT" "$BODY")
           RAW=$(printf "%s" "$MIME" | base64 -w0 | tr '+/' '-_' | tr -d '=')
