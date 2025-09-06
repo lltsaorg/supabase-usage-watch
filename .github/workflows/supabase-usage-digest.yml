@@ -246,12 +246,16 @@ jobs:
             | jq -r '.access_token')
 
           NOW_MMT=$(date -u -d "+6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
-          SUBJECT="[DAILY] Supabase usage — MTD only (no DB snapshots)"
+          # 文字化けしていた件名（UTF-8の記号を含む）
+          SUBJECT_RAW="[DAILY] Supabase usage — MTD only (no DB snapshots)"
+          # RFC 2047 (encoded-word) 形式にする
+          SUBJECT_ENC=$(printf "%s" "$SUBJECT_RAW" | base64 -w0)
+          SUBJECT="=?UTF-8?B?${SUBJECT_ENC}?="
 
           BODY=$(printf "Supabase daily usage (%s)\n\n%s\n%s\n%s\n%s\n" \
             "$NOW_MMT" "$DB_LINE" "$ST_LINE" "$EGRESS_LINE" "$RT_LINE")
 
-          MIME=$(printf "From: %s\nTo: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" \
+          MIME=$(printf "From: %s\nTo: %s\nSubject: %s\nMIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n\n%s" \
             "$GMAIL_FROM" "$GMAIL_TO" "$SUBJECT" "$BODY")
           RAW=$(printf "%s" "$MIME" | base64 -w0 | tr '+/' '-_' | tr -d '=')
           PAYLOAD=$(jq -n --arg raw "$RAW" '{raw:$raw}')
