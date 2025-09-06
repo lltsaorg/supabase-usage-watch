@@ -39,8 +39,30 @@ jobs:
       - name: Validate required env
         run: |
           set -euo pipefail
-          [ -z "${SUPABASE_URL:-}" ] && echo "SUPABASE_URL is empty" && exit 1
-          [ -z "${SERVICE_ROLE_KEY:-}" ] && echo "SERVICE_ROLE_KEY (SRK) is empty" && exit 1
+          mask() { echo "::add-mask::$1"; }
+
+          # 必須: SRK / URL
+          if [ -z "${SERVICE_ROLE_KEY:-}" ]; then
+            echo "ERROR: SERVICE_ROLE_KEY (SRK) is empty. Add repository secret SUPABASE_SERVICE_ROLE_KEY."
+            exit 1
+          fi
+          if [ -z "${SUPABASE_URL:-}" ]; then
+            echo "ERROR: SUPABASE_URL is empty. Add repository secret SUPABASE_URL."
+            exit 1
+          fi
+
+          # 長さだけ出す（中身はマスク）
+          mask "$SERVICE_ROLE_KEY"
+          echo "✔ SUPABASE_URL length: ${#SUPABASE_URL}"
+          echo "✔ SERVICE_ROLE_KEY length: ${#SERVICE_ROLE_KEY}"
+
+          # 参考: PAT は未使用でもOK
+          if [ -n "${SUPABASE_ACCESS_TOKEN:-}" ]; then
+            mask "$SUPABASE_ACCESS_TOKEN"
+            echo "✔ SUPABASE_ACCESS_TOKEN length: ${#SUPABASE_ACCESS_TOKEN}"
+          else
+            echo "ℹ SUPABASE_ACCESS_TOKEN not set (fine for this workflow)"
+          fi
 
       # ===== DB / Storage =====
       - name: Fetch DB & Storage size (MB) via RPC
@@ -120,14 +142,15 @@ jobs:
             rt-baseline-
 
       # Metrics を読み込み、月初基準との差を MTD として算出
+      # === Realtime: MTD 計算 ===
       - name: Read Realtime metrics & compute MTD (no DB)
         id: rt_mtd
         run: |
           set -euo pipefail
+
           METRICS_URL="$SUPABASE_URL/customer/v1/privileged/metrics"
           curl -sS --user "service_role:${SERVICE_ROLE_KEY}" "$METRICS_URL" > metrics.txt
 
-          # *_messages_total を合算（末尾の数値を集計）
           TOTAL=$(
             awk '
               /^[a-z_]+messages_total(\{| )/ && $NF ~ /^[0-9.]+$/ {sum+=$NF}
@@ -135,27 +158,35 @@ jobs:
             ' metrics.txt
           )
 
-          # 既存 baseline の読込（なければ今の TOTAL を baseline に）
           MONTH="${MONTH_KEY:-$(date -u +%Y-%m)}"
-          BASELINE=0
-          if [ -f rt-baseline.json ]; then
-            BASELINE=$(jq -r --arg m "$MONTH" '.[$m] // 0' rt-baseline.json 2>/dev/null || echo 0)
-          fi
 
-          if [ "$BASELINE" = "0" ] || ! echo "$BASELINE" | grep -Eq '^[0-9]+$'; then
-            # 初回は当月の baseline を現在値に設定
-            jq -n --arg m "$MONTH" --argjson t "$TOTAL" '{($m):$t}' > rt-baseline.json
+          # baselineファイルが無ければ空JSONを作成
+          [ -f rt-baseline.json ] || echo '{}' > rt-baseline.json
+
+          BASELINE=$(jq -r --arg m "$MONTH" '.[$m] // 0' rt-baseline.json 2>/dev/null || echo 0)
+
+          if ! echo "$BASELINE" | grep -Eq '^[0-9]+$'; then BASELINE=0; fi
+          if ! echo "$TOTAL"   | grep -Eq '^[0-9]+$'; then TOTAL=0; fi
+
+          if [ "$BASELINE" = "0" ]; then
+            # 初回: 今のTOTALを基準として保存、MTDは0
+            jq --arg m "$MONTH" --argjson t "$TOTAL" '. + {($m): $t}' rt-baseline.json > rt-baseline.tmp
+            mv rt-baseline.tmp rt-baseline.json
             MTD=0
           else
-            # MTD = 現在累積 - 月初累積
             MTD=$(( TOTAL - BASELINE ))
-            if [ $MTD -lt 0 ]; then MTD=0; fi
-            # baseline ファイルに今月キーが無ければ追加（あればそのまま）
-            jq --arg m "$MONTH" --argjson b "$BASELINE" '. * {($m): (.[$m] // $b)}' rt-baseline.json > rt-baseline.tmp || echo '{}'
-            mv rt-baseline.tmp rt-baseline.json || true
+            [ $MTD -lt 0 ] && MTD=0
           fi
 
           echo "realtime_mtd=$MTD" >> "$GITHUB_OUTPUT"
+
+      # baseline を保存（ファイルがあるときだけ）
+      - name: Save RT baseline cache
+        if: ${{ hashFiles('rt-baseline.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: rt-baseline.json
+          key: rt-baseline-${{ env.MONTH_KEY }}
 
       # 更新した baseline を保存（同じキーで上書き）
       - name: Save RT baseline cache
