@@ -5,6 +5,11 @@ on:
     - cron: "0 3 * * *" # 03:00 UTC = 09:30 MMT
   workflow_dispatch:
 
+# キャッシュ保存に必要になることがある
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   digest:
     runs-on: ubuntu-latest
@@ -12,10 +17,7 @@ jobs:
     env:
       # === Supabase ===
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      # SRK を SERVICE_ROLE_KEY にマップ（REST / Metrics は SRK を使う）
-      SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      # （必要なら）Management API 用 PAT。未設定でもOK（この版では未使用）
-      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }} # REST/MetricsはSRKを使用
 
       # === Gmail API ===
       GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
@@ -24,7 +26,7 @@ jobs:
       GMAIL_FROM: ${{ secrets.GMAIL_FROM }}
       GMAIL_TO: ${{ secrets.GMAIL_TO }}
 
-      # === Free caps (未設定なら既定を使用) ===
+      # === Free caps（未設定なら下で既定使用） ===
       DB_FREE_MB: ${{ secrets.DB_FREE_MB }}
       ST_FREE_MB: ${{ secrets.ST_FREE_MB }}
       MONTHLY_EGRESS_FREE_MB: ${{ secrets.MONTHLY_EGRESS_FREE_MB }}
@@ -41,7 +43,6 @@ jobs:
           set -euo pipefail
           mask() { echo "::add-mask::$1"; }
 
-          # 必須: SRK / URL
           if [ -z "${SERVICE_ROLE_KEY:-}" ]; then
             echo "ERROR: SERVICE_ROLE_KEY (SRK) is empty. Add repository secret SUPABASE_SERVICE_ROLE_KEY."
             exit 1
@@ -50,19 +51,9 @@ jobs:
             echo "ERROR: SUPABASE_URL is empty. Add repository secret SUPABASE_URL."
             exit 1
           fi
-
-          # 長さだけ出す（中身はマスク）
           mask "$SERVICE_ROLE_KEY"
           echo "✔ SUPABASE_URL length: ${#SUPABASE_URL}"
           echo "✔ SERVICE_ROLE_KEY length: ${#SERVICE_ROLE_KEY}"
-
-          # 参考: PAT は未使用でもOK
-          if [ -n "${SUPABASE_ACCESS_TOKEN:-}" ]; then
-            mask "$SUPABASE_ACCESS_TOKEN"
-            echo "✔ SUPABASE_ACCESS_TOKEN length: ${#SUPABASE_ACCESS_TOKEN}"
-          else
-            echo "ℹ SUPABASE_ACCESS_TOKEN not set (fine for this workflow)"
-          fi
 
       # ===== DB / Storage =====
       - name: Fetch DB & Storage size (MB) via RPC
@@ -123,7 +114,7 @@ jobs:
 
       # ===== Realtime (MTD) — Metrics 累積値から「月初との差分」、DB保存なし =====
 
-      # 今月キー（例: 2025-09）を $GITHUB_ENV に注入
+      # 月キー（YYYY-MM）を環境に注入
       - name: Init month key
         id: init_month
         run: |
@@ -131,26 +122,25 @@ jobs:
           MONTH_KEY=$(date -u +%Y-%m)
           echo "MONTH_KEY=$MONTH_KEY" >> "$GITHUB_ENV"
 
-      # 月ごとのベースラインをキャッシュから復元
+      # まずは「月キーのプレフィックス」で広く復元（キー衝突を避けるためbootstrapキーを使用）
       - name: Restore RT baseline cache
         id: rt_cache_restore
         uses: actions/cache/restore@v4
         with:
           path: rt-baseline.json
-          key: rt-baseline-${{ env.MONTH_KEY }}
+          key: rt-baseline-${{ env.MONTH_KEY }}-bootstrap
           restore-keys: |
-            rt-baseline-
+            rt-baseline-${{ env.MONTH_KEY }}-
 
-      # Metrics を読み込み、月初基準との差を MTD として算出
-      # === Realtime: MTD 計算 ===
+      # Metrics を読み込み、月初基準との差を MTD として算出（rt-baseline.json を必ず生成・更新）
       - name: Read Realtime metrics & compute MTD (no DB)
         id: rt_mtd
         run: |
           set -euo pipefail
-
           METRICS_URL="$SUPABASE_URL/customer/v1/privileged/metrics"
           curl -sS --user "service_role:${SERVICE_ROLE_KEY}" "$METRICS_URL" > metrics.txt
 
+          # *_messages_total を合算（末尾の数値）
           TOTAL=$(
             awk '
               /^[a-z_]+messages_total(\{| )/ && $NF ~ /^[0-9.]+$/ {sum+=$NF}
@@ -164,7 +154,6 @@ jobs:
           [ -f rt-baseline.json ] || echo '{}' > rt-baseline.json
 
           BASELINE=$(jq -r --arg m "$MONTH" '.[$m] // 0' rt-baseline.json 2>/dev/null || echo 0)
-
           if ! echo "$BASELINE" | grep -Eq '^[0-9]+$'; then BASELINE=0; fi
           if ! echo "$TOTAL"   | grep -Eq '^[0-9]+$'; then TOTAL=0; fi
 
@@ -176,25 +165,30 @@ jobs:
           else
             MTD=$(( TOTAL - BASELINE ))
             [ $MTD -lt 0 ] && MTD=0
+            # 念のためキーが無い場合は補完（既にあれば変更しない）
+            jq --arg m "$MONTH" --argjson b "$BASELINE" '. * {($m): (.[$m] // $b)}' rt-baseline.json > rt-baseline.tmp || echo '{}'
+            mv rt-baseline.tmp rt-baseline.json || true
           fi
 
           echo "realtime_mtd=$MTD" >> "$GITHUB_OUTPUT"
 
-      # baseline を保存（ファイルがあるときだけ）
-      - name: Save RT baseline cache
-        if: ${{ hashFiles('rt-baseline.json') != '' }}
-        uses: actions/cache/save@v4
-        with:
-          path: rt-baseline.json
-          key: rt-baseline-${{ env.MONTH_KEY }}
+      # ファイル内容のハッシュをキーに付け、毎回ユニークなキーで保存（既存キー衝突を回避）
+      - name: Compute cache key (by content hash)
+        id: rt_cache_key
+        run: |
+          set -euo pipefail
+          [ -f rt-baseline.json ] || echo '{}' > rt-baseline.json
+          HASH=$(sha256sum rt-baseline.json | awk '{print $1}')
+          echo "CACHE_KEY=rt-baseline-${MONTH_KEY}-${HASH}" >> "$GITHUB_ENV"
+          echo "Computed cache key: rt-baseline-${MONTH_KEY}-${HASH}"
 
-      # 更新した baseline を保存（同じキーで上書き）
+      # 既に完全一致で復元できていた場合は保存をスキップ
       - name: Save RT baseline cache
-        if: always()
+        if: ${{ steps.rt_cache_restore.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
           path: rt-baseline.json
-          key: rt-baseline-${{ env.MONTH_KEY }}
+          key: ${{ env.CACHE_KEY }}
 
       # ===== メール送信 =====
       - name: Send Gmail digest (MTD only)
