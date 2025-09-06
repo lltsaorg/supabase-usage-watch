@@ -23,12 +23,9 @@ jobs:
       DB_FREE_MB: ${{ secrets.DB_FREE_MB }}
       ST_FREE_MB: ${{ secrets.ST_FREE_MB }}
       MONTHLY_EGRESS_FREE_MB: ${{ secrets.MONTHLY_EGRESS_FREE_MB }}
+      REALTIME_FREE_MESSAGES: ${{ secrets.REALTIME_FREE_MESSAGES }} # default 2,000,000 if unset
       # Retention for usage_snapshots (days)
       USAGE_SNAPSHOT_RETENTION_DAYS: ${{ secrets.USAGE_SNAPSHOT_RETENTION_DAYS }}
-
-      # Realtime free caps (optional overrides; defaults set in steps)
-      REALTIME_FREE_MESSAGES: ${{ secrets.REALTIME_FREE_MESSAGES }}
-      REALTIME_FREE_CONNECTIONS: ${{ secrets.REALTIME_FREE_CONNECTIONS }}
 
     steps:
       - name: Install tools
@@ -47,15 +44,12 @@ jobs:
         run: |
           set -e
           DAYS="${USAGE_SNAPSHOT_RETENTION_DAYS:-90}"
-          # Use ISO8601 UTC timestamp for precise comparison
           CUTOFF_ISO=$(date -u -d "-$DAYS days" +"%Y-%m-%dT%H:%M:%SZ")
           echo "Pruning usage_snapshots older than $DAYS days (before $CUTOFF_ISO)"
-
-          # Delete rows older than cutoff; ignore error if table doesn't exist
           curl -sS -X DELETE \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
             -H "Prefer: count=exact" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?taken_at=lt.$CUTOFF_ISO" >/dev/null || true
+            "$SUPABASE_URL/rest/v1/usage_snapshots?created_at=lt.$CUTOFF_ISO" >/dev/null || true
 
       - name: Fetch DB/Storage (MB)
         id: fetch_ds
@@ -89,230 +83,91 @@ jobs:
             echo "egress_mtd_mb=N/A" >> "$GITHUB_OUTPUT"
           fi
 
-      # ===== Realtime: messages =====
-      - name: Fetch Realtime messages counter (Prometheus)
-        id: rt_counter
+      # ========= Realtime: 累積カウンタの取得 & スナップショット保存 =========
+      - name: Fetch Realtime cumulative & save snapshot
+        id: fetch_rt
         run: |
-          set -euo pipefail
-          RAW=$(curl -sS --user "service_role:${SERVICE_ROLE_KEY}" \
-            "$SUPABASE_URL/customer/v1/privileged/metrics" || true)
+          set -e
 
-          # 複数のメトリクス名に対応して合算
-          RT=$(printf "%s\n" "$RAW" \
-            | awk '$1 !~ /^#/ && ($1 ~ /(realtime.*(messages|events).*(total|count)|channel.*events.*total)/){s+=$2} END{print s+0}')
+          METRICS_URL="$SUPABASE_URL/customer/v1/privileged/metrics"
+          curl -sS --user "service_role:${SERVICE_ROLE_KEY}" "$METRICS_URL" > metrics.txt
 
-          echo "counter=$RT" >> "$GITHUB_OUTPUT"
+          # *_messages_total を広く拾って合算（Prometheus形式）
+          RT_TOTAL=$(
+            awk '
+              /^[a-z_]+messages_total(\{| )/ && $NF ~ /^[0-9.]+$/ {sum+=$NF}
+              END {printf "%.0f", (sum==""?0:sum)}
+            ' metrics.txt
+          )
 
-      - name: Ensure month-start snapshot for Realtime counter
-        id: rt_baseline
-        run: |
-          set -Eeuo pipefail
-
-          MONTH_START_DATE=$(date -u +"%Y-%m-01")
-          MONTH_START="${MONTH_START_DATE}T00:00:00Z"
-
-          # 前提: realtime_msgs_counter は既に存在
-
-          # 月初以降の baseline を取得（HTTPコードとJSON型を検査）
-          HTTP=$(curl -sS -w "%{http_code}" -o rt_base.json \
-            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            -H "Accept: application/json" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_msgs_counter,taken_at&taken_at=gte.$MONTH_START&realtime_msgs_counter=not.is.null&order=taken_at.asc&limit=1")
-
-          if [ "$HTTP" != "200" ]; then
-            BASE=""
-            BASE_AT=""
+          if [ -z "$RT_TOTAL" ] || ! echo "$RT_TOTAL" | grep -Eq '^[0-9]+$'; then
+            echo "Could not parse realtime total. Skipping snapshot insert."
+            echo "realtime_total=N/A" >> "$GITHUB_OUTPUT"
           else
-            BASE=$(jq -r 'if type=="array" and length>0 then .[0].realtime_msgs_counter else empty end' rt_base.json)
-            BASE_AT=$(jq -r 'if type=="array" and length>0 then .[0].taken_at else empty end' rt_base.json)
-          fi
-
-          if [ -z "${BASE:-}" ]; then
-            NOWISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-            CUR="${{ steps.rt_counter.outputs.counter }}"
+            echo "realtime_total=$RT_TOTAL" >> "$GITHUB_OUTPUT"
+            # Supabase に当日のスナップショットを書き込み
             curl -sS -X POST \
               -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-              -H "Prefer: resolution=merge-duplicates" \
-              -H "Accept: application/json" -H "Content-Type: application/json" \
-              "$SUPABASE_URL/rest/v1/usage_snapshots" \
-              -d "{\"taken_at\":\"$NOWISO\",\"realtime_msgs_counter\":${CUR:-0}}" >/dev/null || true
-            BASE="${CUR:-0}"
-            BASE_AT="$NOWISO"
+              -H "Content-Type: application/json" \
+              "$SUPABASE_URL/rest/v1/rpc/take_realtime_snapshot" \
+              -d "{\"in_total\": $RT_TOTAL}" >/dev/null
           fi
 
-          echo "baseline=$BASE" >> "$GITHUB_OUTPUT"
-          echo "base_at=${BASE_AT:-$MONTH_START}" >> "$GITHUB_OUTPUT"
-
-      - name: Compute Realtime MTD & percent
+      # ========= Realtime: 当月MTD（max-min）計算をRPCで取得 =========
+      - name: Compute Realtime MTD (via RPC)
         id: rt_mtd
-        env:
-          COUNTER: ${{ steps.rt_counter.outputs.counter }}
-          BASELINE: ${{ steps.rt_baseline.outputs.baseline }}
         run: |
-          set -euo pipefail
-          REALTIME_FREE_MESSAGES="${REALTIME_FREE_MESSAGES:-2000000}"
-
-          if [ -z "${COUNTER:-}" ] || [ -z "${BASELINE:-}" ]; then
-            echo "mtd=N/A" >> "$GITHUB_OUTPUT"
-            echo "pct=N/A" >> "$GITHUB_OUTPUT"
-          else
-            MTD=$(( ${COUNTER%.*} - ${BASELINE%.*} ))
-            if [ $MTD -lt 0 ]; then MTD=0; fi
-            PCT=$(awk "BEGIN {if ($REALTIME_FREE_MESSAGES==0) print 0; else printf \"%.1f\", ($MTD/$REALTIME_FREE_MESSAGES)*100}")
-            echo "mtd=$MTD" >> "$GITHUB_OUTPUT"
-            echo "pct=$PCT" >> "$GITHUB_OUTPUT"
-          fi
-
-      # ===== Realtime: concurrent connections =====
-      - name: Fetch current Realtime concurrent connections
-        id: rt_conn
-        run: |
-          set -euo pipefail
-          RAW=$(curl -sS --user "service_role:${SERVICE_ROLE_KEY}" \
-            "$SUPABASE_URL/customer/v1/privileged/metrics" || true)
-
-          # 複数候補から最大値を採用
-          CONN=$(printf "%s\n" "$RAW" \
-            | awk '$1 !~ /^#/ {if($1 ~ /realtime.*(client|connection).*connected/ || $1 ~ /realtime.*active.*connections/){if($2>m)m=$2}} END{print m+0}')
-
-          echo "current=$CONN" >> "$GITHUB_OUTPUT"
-
-      - name: Ensure column & update MTD peak for connections
-        id: rt_conn_peak
-        env:
-          CURR: ${{ steps.rt_conn.outputs.current }}
-        run: |
-          set -Eeuo pipefail
-
-          MONTH_START_DATE=$(date -u +"%Y-%m-01")
-          MONTH_START="${MONTH_START_DATE}T00:00:00Z"
-
-          # 前提: realtime_conn_peak と realtime_conn_obs は既に存在
-
-          # 月内ピーク（従来ロジックを維持）
-          HTTP=$(curl -sS -w "%{http_code}" -o rt_conn.json \
+          set -e
+          MONTH_START_UTC=$(date -u +"%Y-%m-01T00:00:00Z")
+          HTTP=$(curl -sS -w "%{http_code}" -o out.json \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            -H "Accept: application/json" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_conn_peak,taken_at&taken_at=gte.$MONTH_START&realtime_conn_peak=not.is.null&order=taken_at.desc&limit=1")
-
+            -H "Content-Type: application/json" \
+            -X POST "$SUPABASE_URL/rest/v1/rpc/get_realtime_mtd" \
+            -d "{\"in_month_start\":\"$MONTH_START_UTC\"}")
           if [ "$HTTP" != "200" ]; then
-            PEAK=""
+            echo "rt_mtd=N/A" >> "$GITHUB_OUTPUT"
           else
-            PEAK=$(jq -r 'if type=="array" and length>0 then .[0].realtime_conn_peak else empty end' rt_conn.json)
+            VAL=$(jq -r '.' out.json)
+            echo "rt_mtd=$VAL" >> "$GITHUB_OUTPUT"
           fi
 
-          CUR=${CURR%.*}
-          if [ -z "${PEAK:-}" ]; then
-            NEW_PEAK="${CUR:-0}"
-          else
-            if [ "${CUR:-0}" -gt "$PEAK" ]; then NEW_PEAK="${CUR:-0}"; else NEW_PEAK="$PEAK"; fi
-          fi
-
-          NOWISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          # 変化があるときだけ MTDピークを記録
-          if [ -z "${PEAK:-}" ] || [ "$NEW_PEAK" -ne "${PEAK:-0}" ]; then
-            curl -sS -X POST \
-              -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-              -H "Prefer: resolution=merge-duplicates" \
-              -H "Accept: application/json" -H "Content-Type: application/json" \
-              "$SUPABASE_URL/rest/v1/usage_snapshots" \
-              -d "{\"taken_at\":\"$NOWISO\",\"realtime_conn_peak\":$NEW_PEAK}" >/dev/null || true
-          fi
-
-          # 観測値は毎回保存（24hピーク算出用）
-          curl -sS -X POST \
-            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            -H "Prefer: resolution=merge-duplicates" \
-            -H "Accept: application/json" -H "Content-Type: application/json" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots" \
-            -d "{\"taken_at\":\"$NOWISO\",\"realtime_conn_obs\":${CUR:-0}}" >/dev/null || true
-
-          echo "peak=${NEW_PEAK:-$PEAK}" >> "$GITHUB_OUTPUT"
-
-      - name: Compute Realtime concurrent connections 24h peak
-        id: rt_conn_24h
-        run: |
-          set -Eeuo pipefail
-          WINDOW_START=$(date -u -d "-24 hours" +"%Y-%m-%dT%H:%M:%SZ")
-
-          HTTP=$(curl -sS -w "%{http_code}" -o rt_conn_obs.json \
-            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            -H "Accept: application/json" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_conn_obs&taken_at=gte.$WINDOW_START&realtime_conn_obs=not.is.null&order=taken_at.desc")
-
-          if [ "$HTTP" != "200" ]; then
-            PEAK24=""
-          else
-            PEAK24=$(jq -r 'if type=="array" and length>0 then [.[].realtime_conn_obs]|max else empty end' rt_conn_obs.json)
-          fi
-
-          echo "peak24=$PEAK24" >> "$GITHUB_OUTPUT"
-
-      - name: Compute Realtime concurrent connections percent
-        id: rt_conn_pct
-        env:
-          PEAK24: ${{ steps.rt_conn_24h.outputs.peak24 }}
-        run: |
-          set -euo pipefail
-          REALTIME_FREE_CONNECTIONS="${REALTIME_FREE_CONNECTIONS:-200}"
-          if [ -z "${PEAK24:-}" ]; then
-            echo "pct=N/A" >> "$GITHUB_OUTPUT"
-            echo "peak=0" >> "$GITHUB_OUTPUT"
-          else
-            PCT=$(awk "BEGIN {if ($REALTIME_FREE_CONNECTIONS==0) print 0; else printf \"%.1f\", ($PEAK24/$REALTIME_FREE_CONNECTIONS)*100}")
-            echo "pct=$PCT" >> "$GITHUB_OUTPUT"
-            echo "peak=$PEAK24" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Write unified snapshot (DB/Storage/Realtime)
-        env:
-          DB: ${{ steps.fetch_ds.outputs.db_mb }}
-          ST: ${{ steps.fetch_ds.outputs.st_mb }}
-          RT_COUNTER: ${{ steps.rt_counter.outputs.counter }}
-          RT_CONN_PEAK: ${{ steps.rt_conn_peak.outputs.peak }}
-          RT_CONN_CURR: ${{ steps.rt_conn.outputs.current }}
-        run: |
-          set -Eeuo pipefail
-          NOWISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          CUR=${RT_CONN_CURR%.*}
-          # すべての主要カラムをまとめて1行に書き込む
-          curl -sS -X POST \
-            -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
-            -H "Prefer: resolution=merge-duplicates" \
-            -H "Accept: application/json" -H "Content-Type: application/json" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots" \
-            -d "{\"taken_at\":\"$NOWISO\",\"db_size_mb\":${DB:-0},\"storage_total_mb\":${ST:-0},\"realtime_msgs_counter\":${RT_COUNTER:-0},\"realtime_conn_peak\":${RT_CONN_PEAK:-0},\"realtime_conn_obs\":${CUR:-0}}" >/dev/null || true
-
-      # ===== メール送信 =====
       - name: Send Gmail digest (overall %)
         env:
           DB: ${{ steps.fetch_ds.outputs.db_mb }}
           ST: ${{ steps.fetch_ds.outputs.st_mb }}
           EGRESS_MTD_MB: ${{ steps.fetch_eg.outputs.egress_mtd_mb }}
-          RT_MTD: ${{ steps.rt_mtd.outputs.mtd }}
-          RT_PCT: ${{ steps.rt_mtd.outputs.pct }}
-          RT_BASE_AT: ${{ steps.rt_baseline.outputs.base_at }}
-          RT_CONN_PEAK_24H: ${{ steps.rt_conn_pct.outputs.peak }}
-          RT_CONN_PCT: ${{ steps.rt_conn_pct.outputs.pct }}
-          REALTIME_FREE_MESSAGES: ${{ secrets.REALTIME_FREE_MESSAGES }}
-          REALTIME_FREE_CONNECTIONS: ${{ secrets.REALTIME_FREE_CONNECTIONS }}
+          REALTIME_TOTAL: ${{ steps.fetch_rt.outputs.realtime_total }}
+          REALTIME_MTD: ${{ steps.rt_mtd.outputs.rt_mtd }}
         run: |
           set -Eeuo pipefail
           DB_FREE_MB="${DB_FREE_MB:-500}"
           ST_FREE_MB="${ST_FREE_MB:-1024}"
           MONTHLY_EGRESS_FREE_MB="${MONTHLY_EGRESS_FREE_MB:-5120}"  # 5GB
-          REALTIME_FREE_MESSAGES="${REALTIME_FREE_MESSAGES:-2000000}"
-          REALTIME_FREE_CONNECTIONS="${REALTIME_FREE_CONNECTIONS:-200}"
+          REALTIME_FREE_MESSAGES="${REALTIME_FREE_MESSAGES:-2000000}" # 200万/月 (Free)
 
           PCT_DB=$(awk "BEGIN {if ($DB_FREE_MB==0) print 0; else printf \"%.1f\", ($DB/$DB_FREE_MB)*100}")
           PCT_ST=$(awk "BEGIN {if ($ST_FREE_MB==0) print 0; else printf \"%.1f\", ($ST/$ST_FREE_MB)*100}")
 
-          if [[ "$EGRESS_MTD_MB" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+          if [[ "${EGRESS_MTD_MB}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
             PCT_EG=$(awk "BEGIN {if ($MONTHLY_EGRESS_FREE_MB==0) print 0; else printf \"%.1f\", ($EGRESS_MTD_MB/$MONTHLY_EGRESS_FREE_MB)*100}")
-            EGRESS_LINE=$(printf "Egress (MTD): %s MB / %s MB  (%s%%)" "$EGRESS_MTD_MB" "$MONTHLY_EGRESS_FREE_MB" "$PCT_EG")
+            EGRESS_LINE=$(printf "Egress (month-to-date): %s MB / %s MB  (%s%%)" "$EGRESS_MTD_MB" "$MONTHLY_EGRESS_FREE_MB" "$PCT_EG")
           else
-            EGRESS_LINE="Egress (MTD): N/A  (enable self-measure or provide source)"
+            EGRESS_LINE="Egress (month-to-date): N/A  (enable self-measure or provide source)"
+          fi
+
+          # Realtime (累積) — 参考表示
+          if [[ "${REALTIME_TOTAL:-}" =~ ^[0-9]+$ ]]; then
+            RT_TOTAL_LINE=$(printf "Realtime (cumulative counter): %s" "$REALTIME_TOTAL")
+          else
+            RT_TOTAL_LINE="Realtime (cumulative counter): N/A"
+          fi
+
+          # Realtime (当月MTD) — %評価の対象
+          if [[ "${REALTIME_MTD:-}" =~ ^[0-9]+$ ]]; then
+            PCT_RT=$(awk "BEGIN {if ($REALTIME_FREE_MESSAGES==0) print 0; else printf \"%.2f\", ($REALTIME_MTD/$REALTIME_FREE_MESSAGES)*100}")
+            RT_MTD_LINE=$(printf "Realtime (month-to-date): %s / %s  (%s%% of monthly free)" "$REALTIME_MTD" "$REALTIME_FREE_MESSAGES" "$PCT_RT")
+          else
+            RT_MTD_LINE="Realtime (month-to-date): N/A"
           fi
 
           ACCESS_TOKEN=$(curl -sS -X POST https://oauth2.googleapis.com/token \
@@ -321,31 +176,11 @@ jobs:
             | jq -r '.access_token')
 
           NOW_MMT=$(date -u -d "+6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
-          NOW_UTC=$(date -u "+%Y-%m-%d %H:%M UTC")
-          MONTH_START_UTC=$(date -u -d "$(date -u +%Y-%m-01)" "+%Y-%m-%d 00:00 UTC")
-          WINDOW_START_UTC=$(date -u -d "-24 hours" "+%Y-%m-%d %H:%M UTC")
+          SUBJECT="[DAILY] Supabase usage summary (overall %)"
 
-          # 取得期間の表記（MMT / 日付含む、分まで）
-          NOW_MMT_SHORT=$(date -u -d "$NOW_UTC +6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
-          DBST_MMT=$(date -u -d "$NOW_UTC +6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
-          EG_START_MMT=$(date -u -d "$MONTH_START_UTC +6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
-          RT_BASE_UTC="${RT_BASE_AT:-$MONTH_START_UTC}"
-          RT_BASE_MMT=$(date -u -d "$RT_BASE_UTC +6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
-          WIN_START_MMT=$(date -u -d "$WINDOW_START_UTC +6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
-
-          SUBJECT="[DAILY] Supabase usage summary (with periods)"
-
-          # 本文を安全に構築（固定のフォーマットに%sを並べ、内容は引数で渡す）
-          BODY=$(printf "%s\n%s\n%s\n%s\n%s\n\n取得期間:\n%s\n%s\n%s\n%s" \
-            "DB: $DB MB / $DB_FREE_MB MB  (${PCT_DB}%) 現在時点の使用量（スナップショット）" \
-            "Storage: $ST MB / $ST_FREE_MB MB  (${PCT_ST}%) 現在時点の使用量（スナップショット）" \
-            "Egress (month-to-date): ${EGRESS_MTD_MB} MB / $MONTHLY_EGRESS_FREE_MB MB  (${PCT_EG:-N/A}%) 月次累計" \
-            "Realtime messages (month-to-date): ${RT_MTD:-N/A} / $REALTIME_FREE_MESSAGES  (${RT_PCT:-N/A}%) 月次累計" \
-            "Realtime concurrent connections (24h peak): ${RT_CONN_PEAK_24H:-N/A} / $REALTIME_FREE_CONNECTIONS  (${RT_CONN_PCT:-N/A}%) 直近24時間ピーク" \
-            "[DB/Storage] $DBST_MMT" \
-            "[Egress] $EG_START_MMT → $NOW_MMT_SHORT" \
-            "[RT msgs] $RT_BASE_MMT → $NOW_MMT_SHORT" \
-            "[RT conn] $WIN_START_MMT → $NOW_MMT_SHORT")
+          BODY=$(printf "Supabase daily usage (%s)\n\nDB: %s MB / %s MB  (%s%%)\nStorage: %s MB / %s MB  (%s%%)\n%s\n%s\n%s\n" \
+            "$NOW_MMT" "$DB" "$DB_FREE_MB" "$PCT_DB" "$ST" "$ST_FREE_MB" "$PCT_ST" \
+            "$EGRESS_LINE" "$RT_MTD_LINE" "$RT_TOTAL_LINE")
 
           MIME=$(printf "From: %s\nTo: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" "$GMAIL_FROM" "$GMAIL_TO" "$SUBJECT" "$BODY")
           RAW=$(printf "%s" "$MIME" | base64 -w0 | tr '+/' '-_' | tr -d '=')
