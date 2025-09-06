@@ -55,7 +55,7 @@ jobs:
           curl -sS -X DELETE \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
             -H "Prefer: count=exact" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?created_at=lt.$CUTOFF_ISO" >/dev/null || true
+            "$SUPABASE_URL/rest/v1/usage_snapshots?taken_at=lt.$CUTOFF_ISO" >/dev/null || true
 
       - name: Fetch DB/Storage (MB)
         id: fetch_ds
@@ -117,14 +117,14 @@ jobs:
           HTTP=$(curl -sS -w "%{http_code}" -o rt_base.json \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
             -H "Accept: application/json" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_msgs_counter,created_at&created_at=gte.$MONTH_START&realtime_msgs_counter=not.is.null&order=created_at.asc&limit=1")
+            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_msgs_counter,taken_at&taken_at=gte.$MONTH_START&realtime_msgs_counter=not.is.null&order=taken_at.asc&limit=1")
 
           if [ "$HTTP" != "200" ]; then
             BASE=""
             BASE_AT=""
           else
             BASE=$(jq -r 'if type=="array" and length>0 then .[0].realtime_msgs_counter else empty end' rt_base.json)
-            BASE_AT=$(jq -r 'if type=="array" and length>0 then .[0].created_at else empty end' rt_base.json)
+            BASE_AT=$(jq -r 'if type=="array" and length>0 then .[0].taken_at else empty end' rt_base.json)
           fi
 
           if [ -z "${BASE:-}" ]; then
@@ -135,7 +135,7 @@ jobs:
               -H "Prefer: resolution=merge-duplicates" \
               -H "Accept: application/json" -H "Content-Type: application/json" \
               "$SUPABASE_URL/rest/v1/usage_snapshots" \
-              -d "{\"created_at\":\"$NOWISO\",\"realtime_msgs_counter\":${CUR:-0}}" >/dev/null || true
+              -d "{\"taken_at\":\"$NOWISO\",\"realtime_msgs_counter\":${CUR:-0}}" >/dev/null || true
             BASE="${CUR:-0}"
             BASE_AT="$NOWISO"
           fi
@@ -193,7 +193,7 @@ jobs:
           HTTP=$(curl -sS -w "%{http_code}" -o rt_conn.json \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
             -H "Accept: application/json" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_conn_peak,created_at&created_at=gte.$MONTH_START&realtime_conn_peak=not.is.null&order=created_at.desc&limit=1")
+            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_conn_peak,taken_at&taken_at=gte.$MONTH_START&realtime_conn_peak=not.is.null&order=taken_at.desc&limit=1")
 
           if [ "$HTTP" != "200" ]; then
             PEAK=""
@@ -217,7 +217,7 @@ jobs:
               -H "Prefer: resolution=merge-duplicates" \
               -H "Accept: application/json" -H "Content-Type: application/json" \
               "$SUPABASE_URL/rest/v1/usage_snapshots" \
-              -d "{\"created_at\":\"$NOWISO\",\"realtime_conn_peak\":$NEW_PEAK}" >/dev/null || true
+              -d "{\"taken_at\":\"$NOWISO\",\"realtime_conn_peak\":$NEW_PEAK}" >/dev/null || true
           fi
 
           # 観測値は毎回保存（24hピーク算出用）
@@ -226,7 +226,7 @@ jobs:
             -H "Prefer: resolution=merge-duplicates" \
             -H "Accept: application/json" -H "Content-Type: application/json" \
             "$SUPABASE_URL/rest/v1/usage_snapshots" \
-            -d "{\"created_at\":\"$NOWISO\",\"realtime_conn_obs\":${CUR:-0}}" >/dev/null || true
+            -d "{\"taken_at\":\"$NOWISO\",\"realtime_conn_obs\":${CUR:-0}}" >/dev/null || true
 
           echo "peak=${NEW_PEAK:-$PEAK}" >> "$GITHUB_OUTPUT"
 
@@ -239,7 +239,7 @@ jobs:
           HTTP=$(curl -sS -w "%{http_code}" -o rt_conn_obs.json \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
             -H "Accept: application/json" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_conn_obs&created_at=gte.$WINDOW_START&realtime_conn_obs=not.is.null&order=created_at.desc")
+            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_conn_obs&taken_at=gte.$WINDOW_START&realtime_conn_obs=not.is.null&order=taken_at.desc")
 
           if [ "$HTTP" != "200" ]; then
             PEAK24=""

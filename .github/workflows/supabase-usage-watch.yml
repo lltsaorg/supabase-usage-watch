@@ -70,7 +70,7 @@ jobs:
           HTTP=$(curl -sS -w "%{http_code}" -o rt_base.json \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
             -H "Accept: application/json" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_msgs_counter,created_at&created_at=gte.$MONTH_START&realtime_msgs_counter=not.is.null&order=created_at.asc&limit=1")
+            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_msgs_counter,taken_at&taken_at=gte.$MONTH_START&realtime_msgs_counter=not.is.null&order=taken_at.asc&limit=1")
           if [ "$HTTP" != "200" ]; then
             echo "baseline=" >> "$GITHUB_OUTPUT"
           else
@@ -120,7 +120,7 @@ jobs:
           HTTP=$(curl -sS -w "%{http_code}" -o rt_peak.json \
             -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" \
             -H "Accept: application/json" \
-            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_conn_peak,created_at&created_at=gte.$MONTH_START&realtime_conn_peak=not.is.null&order=created_at.desc&limit=1")
+            "$SUPABASE_URL/rest/v1/usage_snapshots?select=realtime_conn_peak,taken_at&taken_at=gte.$MONTH_START&realtime_conn_peak=not.is.null&order=taken_at.desc&limit=1")
           if [ "$HTTP" != "200" ]; then
             echo "peak=" >> "$GITHUB_OUTPUT"
           else
