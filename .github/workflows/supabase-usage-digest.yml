@@ -247,7 +247,7 @@ jobs:
 
           NOW_MMT=$(date -u -d "+6 hours 30 minutes" "+%Y-%m-%d %H:%M MMT")
           # 文字化けしていた件名（UTF-8の記号を含む）
-          SUBJECT_RAW="[DAILY] Supabase usage — MTD only (no DB snapshots)"
+          SUBJECT_RAW="[DAILY] Supabase usage - MTD only (no DB snapshots)"
           # RFC 2047 (encoded-word) 形式にする
           SUBJECT_ENC=$(printf "%s" "$SUBJECT_RAW" | base64 -w0)
           SUBJECT="=?UTF-8?B?${SUBJECT_ENC}?="
